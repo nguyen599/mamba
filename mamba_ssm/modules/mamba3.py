@@ -9,13 +9,19 @@ import torch.nn.functional as F
 
 from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 
-from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as mamba3_mimo_combined
-from mamba_ssm.ops.triton.angle_cumsum import angle_dt
+try:
+    from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as mamba3_mimo_combined
+except ImportError:
+    mamba3_mimo_combined = None
+
 from mamba_ssm.ops.triton.mamba3.mamba3_siso_combined import mamba3_siso_combined
 
 from mamba_ssm.ops.triton.mamba3.mamba3_mimo_rotary_step import apply_rotary_qk_inference_fwd
 
-from mamba_ssm.ops.cute.mamba3.mamba3_step_fn import mamba3_step_fn
+try:
+    from mamba_ssm.ops.cute.mamba3.mamba3_step_fn import mamba3_step_fn
+except ImportError:    
+    mamba3_step_fn = None
 
 class Mamba3(nn.Module):
     def __init__(
@@ -59,6 +65,8 @@ class Mamba3(nn.Module):
         self.mimo_rank = mimo_rank
         if not self.is_mimo:
             self.mimo_rank = 1
+        else:
+            assert mamba3_mimo_combined is not None, "Fails to import Mamba-3 MIMO kernels. Please ensure you installed the necessary dependencies, such as TileLang."
 
         self.d_inner = int(self.expand * self.d_model)
         assert self.d_inner % self.headdim == 0
@@ -130,17 +138,12 @@ class Mamba3(nn.Module):
         Returns: same shape as u
         """
         batch, seqlen, dim = u.shape
-        if cu_seqlens is not None:
-            raise NotImplementedError("Currently does not support varlen in Mamba-3 (MIMO).")
 
         angle_dt_state, ssm_state, k_state, v_state  = None, None, None, None
         if inference_params is not None:
             inference_batch = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else batch
             angle_dt_state, ssm_state, k_state, v_state = self._get_states_from_cache(inference_params, inference_batch)
             if inference_params.seqlen_offset > 0:
-                # The states are updated inplace here; however, due to the current implementation,
-                # setting inplace=True incurs significant overhead. So potentially
-                # faster to call step() directly with inplace=False:
                 out, _, _, _, _ = self.step(u, angle_dt_state, ssm_state, k_state, v_state)
                 return out
 
@@ -170,8 +173,8 @@ class Mamba3(nn.Module):
         DT = rearrange(DT, "b l n -> b n l")
         ADT = rearrange(ADT, "b l n -> b n l")
 
-        # Compute angle
-        angles = angles.unsqueeze(-2).expand(-1, -1, self.nheads, -1) # (B, L, N, S)
+        # Compute angle — cast to float32 as required by the MIMO/SISO kernels
+        angles = angles.unsqueeze(-2).expand(-1, -1, self.nheads, -1).to(torch.float32) # (B, L, N, S)
 
         # Apply RMS Norm on B and C
         B = self.B_norm(B)
@@ -179,7 +182,6 @@ class Mamba3(nn.Module):
         
         # Apply Mamba-3 kernel
         if self.is_mimo:
-            angles = angle_dt(angles, DT.transpose(-1, -2)) # (B, L, N, S)
             y = mamba3_mimo_combined(
                 Q=C,
                 K=B,
@@ -199,6 +201,7 @@ class Mamba3(nn.Module):
                 rotary_dim_divisor=self.rotary_dim_divisor,
                 dtype=x.dtype,
                 return_state=ssm_state is not None,
+                cu_seqlens=cu_seqlens,
             )
             if ssm_state is not None:
                 y, last_angle, last_state, last_k, last_v, *rest = y
@@ -230,12 +233,13 @@ class Mamba3(nn.Module):
                 chunk_size=self.chunk_size,
                 Input_States=None,
                 return_final_states=ssm_state is not None,
+                cu_seqlens=cu_seqlens,
             )
             if ssm_state is not None:
                 y, last_angle, last_state, last_k, last_v, *rest = y
                 angle_dt_state.copy_(last_angle)
                 ssm_state.copy_(last_state)
-                k_state.copy_(last_k)
+                k_state.copy_(last_k.unsqueeze(1))
                 v_state.copy_(last_v)
             y = rearrange(y, "b l h p -> b l (h p)")
             if self.is_outproj_norm:
@@ -301,6 +305,7 @@ class Mamba3(nn.Module):
             nxt_k_state: (batch, R, nheads, d_state), where R = mimo_rank (R=1 if not MIMO)
             nxt_v_state: (batch, nheads, headdim)
         """
+        assert mamba3_step_fn is not None, "Cute Mamba-3 step function is not available. Please ensure you installed the necessary dependencies, such as nvidia-cutlass-dsl and quack-kernels."
 
         # in_proj
         zxBCdt = self.in_proj(u)
@@ -472,7 +477,7 @@ class Mamba3(nn.Module):
                 )
             else:
                 k_state = torch.zeros(
-                    (batch_size, self.nheads, self.d_state),
+                    (batch_size, 1, self.nheads, self.d_state),
                     device=device,
                     dtype=dtype,
                 )
